@@ -71,29 +71,17 @@ export async function onRequestGet(context) {
   });
   upstream.addEventListener('message', async (event) => {
     if (server.readyState !== WebSocket.OPEN) return;
-    let data = event.data;
-    // 尽量保持文本帧：Gemini 的 JSON 消息是文本，直接字符串转发。
-    // 只有真正的二进制（音频响应）才转 ArrayBuffer。
-    if (typeof data === 'object' && data !== null) {
-      if (typeof data.text === 'function' && !(data instanceof ArrayBuffer)) {
-        // Blob 或类似对象：先尝试文本
-        try {
-          const text = await data.text();
-          if (text && text.trimStart().startsWith('{')) {
-            data = text; // JSON 消息按文本转发
-          } else {
-            data = await data.arrayBuffer();
-          }
-        } catch {
-          data = String(data);
-        }
-      } else if (typeof data.arrayBuffer === 'function') {
-        data = await data.arrayBuffer();
-      } else {
-        data = String(data);
-      }
+    // Gemini 的控制消息是文本。不要根据正文猜测帧类型：这会使转发依赖
+    // Workers 运行时的 Blob 实现，并可能在异步转换期间丢失或重排消息。
+    if (typeof event.data === 'string') {
+      server.send(event.data);
+      return;
     }
-    server.send(data);
+
+    const data = event.data instanceof ArrayBuffer
+      ? event.data
+      : await event.data.arrayBuffer();
+    if (server.readyState === WebSocket.OPEN) server.send(data);
   });
 
   server.addEventListener('close', () => {

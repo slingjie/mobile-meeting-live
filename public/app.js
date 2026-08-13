@@ -290,6 +290,18 @@ function sendAudioStreamEnd() {
   }
 }
 
+async function decodeGeminiFrame(data) {
+  if (typeof data === 'string') return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) {
+    return new TextDecoder().decode(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+  }
+  if (data && typeof data.arrayBuffer === 'function') {
+    return new TextDecoder().decode(await data.arrayBuffer());
+  }
+  throw new TypeError(`Unsupported Gemini WebSocket frame: ${Object.prototype.toString.call(data)}`);
+}
+
 async function connectGemini({ reconnect = false } = {}) {
   if (!isRunning && reconnect) return;
   if (isConnecting) return;
@@ -305,7 +317,28 @@ async function connectGemini({ reconnect = false } = {}) {
       ? GEMINI_WS  // 代理模式：浏览器 → pages.dev/ws，token 服务端注入
       : `${GEMINI_WS}?access_token=${encodeURIComponent(token)}`;  // 本地直连模式
     const socket = new WebSocket(wsUrl);
+    // 显式要求二进制帧为 ArrayBuffer，避免 Safari 默认 Blob 的异步读取路径。
+    socket.binaryType = 'arraybuffer';
     ws = socket;
+
+    // 必须在发送 setup 之前注册，避免移动网络下 setupComplete 到达过快而丢失。
+    socket.addEventListener('message', async (event) => {
+      recvMessages += 1;
+      renderDiagnostics();
+      try {
+        handleGeminiMessage(JSON.parse(await decodeGeminiFrame(event.data)));
+      } catch (error) {
+        console.warn('Bad Gemini message', error);
+      }
+    });
+
+    socket.addEventListener('close', () => {
+      if (serial !== sessionSerial || !isRunning) return;
+      setConnection('连接断开', 'error');
+      window.setTimeout(() => {
+        if (isRunning && serial === sessionSerial) connectGemini({ reconnect: true }).catch(console.error);
+      }, 1200);
+    });
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Gemini WebSocket connection timeout.')), 12000);
@@ -338,32 +371,6 @@ async function connectGemini({ reconnect = false } = {}) {
         clearTimeout(timeout);
         reject(new Error('Gemini WebSocket connection failed.'));
       }, { once: true });
-    });
-
-    socket.addEventListener('message', async (event) => {
-      recvMessages += 1;
-      renderDiagnostics();
-      let data = event.data;
-      // 兼容二进制帧：代理可能以 ArrayBuffer/Blob 转发 Gemini 消息
-      if (typeof data !== 'string') {
-        if (typeof data.arrayBuffer === 'function') {
-          data = new TextDecoder().decode(await data.arrayBuffer());
-        } else if (typeof data.text === 'function') {
-          data = await data.text();
-        } else {
-          data = String(data);
-        }
-      }
-      try { handleGeminiMessage(JSON.parse(data)); }
-      catch (error) { console.warn('Bad Gemini message', error); }
-    });
-
-    socket.addEventListener('close', () => {
-      if (serial !== sessionSerial || !isRunning) return;
-      setConnection('连接断开', 'error');
-      window.setTimeout(() => {
-        if (isRunning && serial === sessionSerial) connectGemini({ reconnect: true }).catch(console.error);
-      }, 1200);
     });
 
     if (reconnectId) clearTimeout(reconnectId);
