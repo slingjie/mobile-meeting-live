@@ -43,13 +43,12 @@ let entries = [];
 let sequence = 0;
 let currentTurnText = '';
 let currentTurnTranslation = '';
-let currentTurnStartedAt = null;
 let sessionSerial = 0;
 
-function nowClock(date = new Date()) {
+function nowClock() {
   return new Intl.DateTimeFormat('zh-CN', {
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-  }).format(date);
+  }).format(new Date());
 }
 
 function formatDuration(ms) {
@@ -186,8 +185,6 @@ function commitCurrentTurn() {
   const translation = currentTurnTranslation.trim();
   currentTurnText = '';
   currentTurnTranslation = '';
-  const startedAt = currentTurnStartedAt;
-  currentTurnStartedAt = null;
   if (!text) {
     renderEntries();
     return;
@@ -199,15 +196,22 @@ function commitCurrentTurn() {
     return;
   }
 
-  entries.push({
-    id: `g-${Date.now()}-${sequence}`,
-    seq: sequence++,
-    time: nowClock(startedAt ? new Date(startedAt) : new Date()),
-    text,
-    translation
-  });
+  entries.push({ id: `g-${Date.now()}-${sequence}`, seq: sequence++, time: nowClock(), text, translation });
   persist();
   renderEntries();
+}
+
+// 兜底切句：Gemini 翻译模型不一定发 turnComplete，streamEnd 后若迟迟没有
+// turnComplete，则强制把当前已识别的句子落成一条记录（带时间戳）。
+let forcedCommitTimer = null;
+function scheduleForcedCommit() {
+  if (forcedCommitTimer) clearTimeout(forcedCommitTimer);
+  forcedCommitTimer = setTimeout(() => {
+    if (!isRunning) return;
+    if (currentTurnText.trim() || currentTurnTranslation.trim()) {
+      commitCurrentTurn();
+    }
+  }, 2000);
 }
 
 function handleGeminiMessage(message) {
@@ -245,48 +249,42 @@ function bytesToBase64(uint8) {
   return btoa(binary);
 }
 
-// 前端 VAD 是唯一的分句器：Gemini 的自动 VAD 已关闭，避免两个状态机争夺 turn 边界。
-const VAD_SILENCE_MS = 450; // 短停顿即可开始翻译，降低端到端延迟
-const VAD_MIN_SPEECH_MS = 120;
+// 前端 VAD：检测静音停顿，自动发送 audioStreamEnd 触发 Gemini 返回转录
+const VAD_SILENCE_MS = 500;   // 静音持续 500ms 视为句子结束（降低延迟）
+const VAD_MIN_SPEECH_MS = 200; // 至少 200ms 语音才值得切句
 let vadSpeaking = false;
 let vadSpeechStart = 0;
 let vadSilenceStart = 0;
 let vadLastPacket = 0;
 let vadNoiseFloor = 150;
-let vadThreshold = 0;
 
-function detectAndSendActivity(pcm, isPaused) {
+function detectAndSendStreamEnd(pcm, isPaused) {
   if (isPaused || !ws || ws.readyState !== WebSocket.OPEN) return;
 
   const view = new Int16Array(pcm.buffer || pcm, pcm.byteOffset || 0, Math.floor(pcm.byteLength / 2));
-  let squareSum = 0;
+  let energy = 0;
   for (let i = 0; i < view.length; i++) {
-    const v = view[i];
-    squareSum += v * v;
+    const v = Math.abs(view[i]);
+    energy += v;
   }
-  const energy = Math.sqrt(squareSum / Math.max(1, view.length));
+  energy /= Math.max(1, view.length);
 
   const now = Date.now();
-  // 根据启动后的环境底噪自适应，并为开始/结束使用不同阈值，
-  // 防止会议室持续噪声让固定 400 阈值一直误判为“讲话”。
+  // 自适应阈值：跟踪环境底噪，说话阈值 = 底噪×2（下限 250），避免固定 400 在嘈杂环境误判
   if (!vadSpeaking) vadNoiseFloor = vadNoiseFloor * 0.92 + energy * 0.08;
-  const startThreshold = Math.max(250, vadNoiseFloor * 1.8);
-  const endThreshold = Math.max(180, vadNoiseFloor * 1.3);
-  vadThreshold = vadSpeaking ? endThreshold : startThreshold;
-  const speaking = energy >= vadThreshold;
+  const THRESHOLD = Math.max(250, vadNoiseFloor * 2);
+  const speaking = energy >= THRESHOLD;
 
   if (speaking && !vadSpeaking) {
     vadSpeaking = true;
     vadSpeechStart = now;
     vadSilenceStart = 0;
-    currentTurnStartedAt ??= now;
-    sendActivityStart();
   } else if (!speaking && vadSpeaking) {
     if (!vadSilenceStart) vadSilenceStart = now;
     if (now - vadSilenceStart >= VAD_SILENCE_MS) {
       if (now - vadSpeechStart >= VAD_MIN_SPEECH_MS) {
-        // 手动 VAD 模式：activityEnd 才是每一句的正式 turn 边界。
-        sendActivityEnd();
+        // 一句说完：发 streamEnd 让 Gemini 输出转录
+        sendAudioStreamEnd();
       }
       vadSpeaking = false;
       vadSilenceStart = 0;
@@ -320,8 +318,7 @@ function updateMicLevel(pcm) {
 function renderDiagnostics() {
   const el = document.getElementById('diagInfo');
   if (!el) return;
-  const vad = vadSpeaking ? `讲话（阈值${Math.round(vadThreshold)}）` : `静音（阈值${Math.round(vadThreshold)}）`;
-  el.textContent = `音频↑${sentPackets}包/${(sentBytes / 1024).toFixed(1)}KB · 服务端消息↓${recvMessages} · VAD ${vad}`;
+  el.textContent = `音频↑${sentPackets}包/${(sentBytes / 1024).toFixed(1)}KB · 服务端消息↓${recvMessages}`;
 }
 
 async function fetchToken() {
@@ -333,16 +330,12 @@ async function fetchToken() {
   return response.json();
 }
 
-function sendActivityStart() {
+function sendAudioStreamEnd() {
   if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+    ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
   }
-}
-
-function sendActivityEnd() {
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
-  }
+  // streamEnd 已发出：2 秒内若无 turnComplete，前端强制切句落条
+  scheduleForcedCommit();
 }
 
 async function decodeGeminiFrame(data) {
@@ -411,7 +404,9 @@ async function connectGemini({ reconnect = false } = {}) {
             outputAudioTranscription: {},
             realtimeInputConfig: {
               automaticActivityDetection: {
-                disabled: true
+                disabled: false,
+                prefixPaddingMs: 250,
+                silenceDurationMs: 650
               }
             },
             systemInstruction: {
@@ -473,7 +468,7 @@ async function startAudioCapture() {
     if (!isRunning || isPaused || !ws || ws.readyState !== WebSocket.OPEN) return;
     const pcm = new Uint8Array(event.data);
     updateMicLevel(event.data);
-    detectAndSendActivity(event.data, isPaused);
+    detectAndSendStreamEnd(event.data, isPaused);
     sentPackets += 1;
     sentBytes += pcm.byteLength;
     renderDiagnostics();
@@ -496,12 +491,6 @@ async function startAudioCapture() {
 
 async function startMeeting() {
   if (isRunning || isConnecting) return;
-  vadSpeaking = false;
-  vadSpeechStart = 0;
-  vadSilenceStart = 0;
-  vadNoiseFloor = 150;
-  vadThreshold = 0;
-  currentTurnStartedAt = null;
   isRunning = true;
   isPaused = false;
   startedAt = Date.now();
@@ -532,9 +521,7 @@ async function togglePause() {
   if (!isPaused) {
     isPaused = true;
     pausedAt = Date.now();
-    if (vadSpeaking) sendActivityEnd();
-    vadSpeaking = false;
-    vadSilenceStart = 0;
+    sendAudioStreamEnd();
     micStream.getAudioTracks().forEach(t => { t.enabled = false; });
     commitCurrentTurn();
     setUiState('paused');
@@ -550,15 +537,14 @@ async function togglePause() {
 }
 
 async function cleanupConnection() {
+  if (forcedCommitTimer) clearTimeout(forcedCommitTimer);
   if (timerId) clearInterval(timerId);
   if (reconnectId) clearTimeout(reconnectId);
   timerId = null;
   reconnectId = null;
   sessionSerial += 1;
 
-  try { if (vadSpeaking) sendActivityEnd(); } catch {}
-  vadSpeaking = false;
-  vadSilenceStart = 0;
+  try { sendAudioStreamEnd(); } catch {}
   try { ws?.close(); } catch {}
   ws = null;
 
