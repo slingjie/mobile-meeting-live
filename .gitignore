@@ -1,0 +1,12 @@
+# 本地环境变量（含 GEMINI_API_KEY）——严禁上传
+.env
+.env.*
+!.env.example
+
+# 依赖与构建产物
+node_modules/
+dist/
+.wrangler/
+
+# macOS
+.DS_Store
