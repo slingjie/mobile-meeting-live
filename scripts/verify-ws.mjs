@@ -26,10 +26,11 @@ const socket = new WebSocket(endpoint);
 socket.binaryType = 'arraybuffer';
 let setupComplete = false;
 let transcription = '';
+let translation = '';
 let received = 0;
 let finished = false;
 
-const timeout = setTimeout(() => finish(new Error('Timed out waiting for input transcription.')), 30000);
+const timeout = setTimeout(() => finish(new Error('Timed out waiting for transcription and translation.')), 45000);
 function finish(error) {
   if (finished) return;
   finished = true;
@@ -39,7 +40,7 @@ function finish(error) {
     console.error(`FAIL: ${error.message} setupComplete=${setupComplete} messages=${received}`);
     process.exitCode = 1;
   } else {
-    console.log(`PASS: setupComplete + inputTranscription (${transcription})`);
+    console.log(`PASS: setupComplete + inputTranscription + outputTranscription (${transcription} -> ${translation})`);
   }
 }
 
@@ -50,7 +51,7 @@ function sendAudioInChunks() {
     if (socket.readyState !== WebSocket.OPEN) return clearInterval(interval);
     if (offset >= pcm.length) {
       clearInterval(interval);
-      socket.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+      socket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
       return;
     }
     const chunk = pcm.subarray(offset, offset + chunkBytes);
@@ -64,9 +65,14 @@ function sendAudioInChunks() {
 socket.addEventListener('open', () => {
   socket.send(JSON.stringify({
     setup: {
-      model: 'models/gemini-3.1-flash-live-preview',
-      generationConfig: { responseModalities: ['AUDIO'] },
-      inputAudioTranscription: {}
+      model: 'models/gemini-3.5-live-translate-preview',
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        translationConfig: { targetLanguageCode: 'zh-CN', echoTargetLanguage: true }
+      },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      realtimeInputConfig: { automaticActivityDetection: { disabled: true } }
     }
   }));
 });
@@ -77,10 +83,16 @@ socket.addEventListener('message', (event) => {
   const message = JSON.parse(text);
   if (message.setupComplete && !setupComplete) {
     setupComplete = true;
+    socket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
     sendAudioInChunks();
   }
   if (message.serverContent?.inputTranscription?.text) {
-    transcription = message.serverContent.inputTranscription.text;
+    transcription += message.serverContent.inputTranscription.text;
+  }
+  if (message.serverContent?.outputTranscription?.text) {
+    translation += message.serverContent.outputTranscription.text;
+  }
+  if (transcription && translation) {
     finish();
   }
 });
