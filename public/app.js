@@ -17,7 +17,9 @@ const els = {
 };
 
 const STORAGE_KEY = 'meeting-live:gemini:last-session:v1';
-const MODEL = 'gemini-3.1-flash-live-preview';
+// 实时翻译模型：输入语音 → 输出中文翻译（音频+文本）
+const MODEL = 'gemini-3.5-live-translate-preview';
+const TARGET_LANG = 'zh-CN'; // 目标语言：中文
 // 通过 Cloudflare Pages Function 代理（浏览器 → pages.dev/ws → Google），
 // 国内网络无需直连 Google WSS；token 由服务端生成并注入。
 const GEMINI_WS = '/ws';
@@ -40,6 +42,7 @@ let isConnecting = false;
 let entries = [];
 let sequence = 0;
 let currentTurnText = '';
+let currentTurnTranslation = '';
 let sessionSerial = 0;
 
 function nowClock() {
@@ -112,13 +115,33 @@ function renderEntries() {
     const text = document.createElement('div');
     text.className = 'transcript-text';
     text.textContent = entry.text;
+    if (entry.translation) {
+      const trans = document.createElement('div');
+      trans.className = 'transcript-translation';
+      trans.textContent = '🌐 ' + entry.translation;
+      text.appendChild(trans);
+    }
 
     row.append(time, text);
     els.list.appendChild(row);
   }
 
-  els.partial.textContent = currentTurnText.trim();
-  els.partial.classList.toggle('hidden', !currentTurnText.trim());
+  const partialText = currentTurnText.trim();
+  const partialTrans = currentTurnTranslation.trim();
+  els.partial.innerHTML = '';
+  if (partialText) {
+    const p = document.createElement('div');
+    p.className = 'partial-original';
+    p.textContent = partialText;
+    els.partial.appendChild(p);
+  }
+  if (partialTrans) {
+    const t = document.createElement('div');
+    t.className = 'partial-translation';
+    t.textContent = '🌐 ' + partialTrans;
+    els.partial.appendChild(t);
+  }
+  els.partial.classList.toggle('hidden', !partialText && !partialTrans);
   els.exportMd.disabled = entries.length === 0;
   els.exportTxt.disabled = entries.length === 0;
   requestAnimationFrame(() => { els.panel.scrollTop = els.panel.scrollHeight; });
@@ -159,7 +182,9 @@ function mergeTranscript(prev, next) {
 
 function commitCurrentTurn() {
   const text = currentTurnText.trim();
+  const translation = currentTurnTranslation.trim();
   currentTurnText = '';
+  currentTurnTranslation = '';
   if (!text) {
     renderEntries();
     return;
@@ -171,7 +196,7 @@ function commitCurrentTurn() {
     return;
   }
 
-  entries.push({ id: `g-${Date.now()}-${sequence}`, seq: sequence++, time: nowClock(), text });
+  entries.push({ id: `g-${Date.now()}-${sequence}`, seq: sequence++, time: nowClock(), text, translation });
   persist();
   renderEntries();
 }
@@ -187,6 +212,11 @@ function handleGeminiMessage(message) {
 
   if (content.inputTranscription?.text) {
     currentTurnText = mergeTranscript(currentTurnText, content.inputTranscription.text);
+    renderEntries();
+  }
+
+  if (content.outputTranscription?.text) {
+    currentTurnTranslation = mergeTranscript(currentTurnTranslation, content.outputTranscription.text);
     renderEntries();
   }
 
@@ -348,8 +378,12 @@ async function connectGemini({ reconnect = false } = {}) {
         socket.send(JSON.stringify({
           setup: {
             model: `models/${MODEL}`,
-            generationConfig: { responseModalities: ['AUDIO'] },
+            generationConfig: {
+              responseModalities: ['AUDIO'],
+              translationConfig: { targetLanguageCode: TARGET_LANG, echoTargetLanguage: true }
+            },
             inputAudioTranscription: {},
+            outputAudioTranscription: {},
             realtimeInputConfig: {
               automaticActivityDetection: {
                 disabled: false,
@@ -359,7 +393,7 @@ async function connectGemini({ reconnect = false } = {}) {
             },
             systemInstruction: {
               parts: [{
-                text: 'You are a silent meeting transcription listener. Do not speak, answer, summarize, or interrupt. Listen to Chinese, Vietnamese, and English technical project meetings. Pay special attention to photovoltaic power, battery energy storage systems, EPC, grid connection, EMS, PCS, BMS, SCADA, 10kV, 35kV, 110kV, floating PV, fire protection, commissioning, acceptance, contracts, responsibilities, schedules, risks, and engineering decisions. Only the input audio transcription is used by the application.'
+                text: 'You are a silent meeting translation listener. Do not speak, answer, summarize, or interrupt. Listen to Chinese, Vietnamese, and English technical project meetings and translate them into Chinese. Pay special attention to photovoltaic power, battery energy storage systems, EPC, grid connection, EMS, PCS, BMS, SCADA, 10kV, 35kV, 110kV, floating PV, fire protection, commissioning, acceptance, contracts, responsibilities, schedules, risks, and engineering decisions. Only the input audio transcription and output translation are used by the application.'
               }]
             }
           }
@@ -538,7 +572,7 @@ function buildMarkdown() {
 
 function buildText() {
   const title = (els.title.value || '会议记录').trim();
-  return [title, `导出时间：${new Date().toLocaleString('zh-CN')}`, '', ...entries.map(item => `[${item.time}] ${item.text}`)].join('\n');
+  return [title, `导出时间：${new Date().toLocaleString('zh-CN')}`, '', ...entries.map(item => `[${item.time}] ${item.text}${item.translation ? `\n🌐 ${item.translation}` : ''}`)].join('\n');
 }
 
 function download(text, filename, mime) {

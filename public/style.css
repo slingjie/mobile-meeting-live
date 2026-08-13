@@ -81,6 +81,9 @@ h1 { margin: 4px 0 0; font-size: 24px; letter-spacing: -.03em; }
 .link-btn:disabled { opacity: .35; }
 .footer-note { text-align: center; color: #596572; font-size: 11px; line-height: 1.5; padding: 2px 8px 0; }
 
+.transcript-translation { margin-top: 4px; color: #7dd3fc; font-size: 0.95em; }
+.partial-translation { margin-top: 4px; color: #7dd3fc; font-size: 0.95em; }
+.partial-original { color: #f2f5f8; }
 .mic-meter { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 .mic-meter.hidden { display: none; }
 .mic-meter-label { color: #8fa1b3; font-size: 12px; white-space: nowrap; }
