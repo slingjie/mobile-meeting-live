@@ -2,7 +2,6 @@
 
 一个面向**手机浏览器**的实时会议转录与翻译工具。支持中文 / 越南语 / 英文混合会议，实时语音转文字并**翻译成中文**，适用于光伏/储能等海外工程项目的中外技术会议。
 
-- 🌐 在线体验：<https://mobile-meeting-live.pages.dev>
 - 🚀 部署平台：Cloudflare Pages（国内可访问，API Key 不出服务器）
 
 ---
@@ -74,11 +73,7 @@ npx wrangler pages project create mobile-meeting-live --production-branch main
 npx wrangler pages deploy public --project-name mobile-meeting-live --branch main --commit-dirty=true
 ```
 
-部署完成后会输出 `https://<hash>.mobile-meeting-live.pages.dev`，正式域名固定为：
-
-```
-https://mobile-meeting-live.pages.dev
-```
+部署完成后会输出一个 `https://<hash>.<project-name>.pages.dev` 的预览地址。你的正式域名（自定义或默认 `<project-name>.pages.dev`）可在 Cloudflare Dashboard 查看。
 
 ### 3. 配置密钥（关键！）
 
@@ -91,7 +86,7 @@ echo "你的_GEMINI_API_Key" | npx wrangler pages secret put GEMINI_API_KEY --pr
 
 ```bash
 # 健康检查
-curl https://mobile-meeting-live.pages.dev/health
+curl https://<your-project>.pages.dev/health
 
 # 全链路验证（需要一段 16kHz 单声道 PCM 音频）
 node scripts/verify-ws.mjs /path/to/audio.pcm
