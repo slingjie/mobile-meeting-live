@@ -42,6 +42,12 @@ h1 { margin: 4px 0 0; font-size: 24px; letter-spacing: -.03em; }
   background: #171c22; color: #f5f7fa; font-size: 16px;
 }
 .title-input::placeholder { color: #66717e; }
+.mode-row { margin-top: 12px; }
+.mode-select {
+  width: 100%; border: 1px solid #29313b; outline: 0; border-radius: 12px; padding: 11px 12px;
+  background: #171c22; color: #dce5ee; font-size: 14px;
+}
+.mode-select:disabled { opacity: .55; }
 
 .status-row { margin-top: 13px; display: flex; align-items: center; justify-content: space-between; }
 .recording-state { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #aab4c0; }
@@ -66,6 +72,13 @@ h1 { margin: 4px 0 0; font-size: 24px; letter-spacing: -.03em; }
 .transcript-item { display: grid; grid-template-columns: 62px 1fr; gap: 10px; align-items: start; }
 .transcript-time { color: #6f7b87; font-size: 12px; padding-top: 3px; font-variant-numeric: tabular-nums; }
 .transcript-text { color: #f2f5f8; font-size: 18px; line-height: 1.65; word-break: break-word; }
+.transcript-speaker { margin-bottom: 2px; color: #a78bfa; font-size: 11px; line-height: 1.4; font-weight: 700; letter-spacing: .02em; }
+.transcript-source { display: block; }
+.transcript-item.refining .transcript-text { color: #cbd5df; }
+.transcript-status { display: inline-block; margin-left: 8px; padding: 1px 6px; border-radius: 999px; font-size: 10px; line-height: 1.5; vertical-align: 2px; font-weight: 600; }
+.transcript-status.refining { color: #fbbf24; background: rgba(251, 191, 36, .12); }
+.transcript-status.final { color: #34d399; background: rgba(52, 211, 153, .12); }
+.transcript-status.failed { color: #94a3b8; background: rgba(148, 163, 184, .12); }
 .partial-line { margin: 14px 0 0 72px; color: #98a3ae; font-size: 18px; line-height: 1.65; opacity: .85; }
 .hidden { display: none !important; }
 

@@ -1,3 +1,5 @@
+import { createFinalizeTicket } from './_lib/finalize-ticket.js';
+
 // Cloudflare Pages Function — WebSocket 代理
 // 浏览器 → pages.dev/ws → (Cloudflare 服务器) → Google Gemini Live WSS
 // 解决国内网络无法直连 Google WSS 的问题；GEMINI_API_KEY 不出 Cloudflare。
@@ -39,6 +41,12 @@ export async function onRequestGet(context) {
   const pair = new WebSocketPair();
   const [client, server] = pair;
   server.accept();
+  const finalizeTicket = await createFinalizeTicket({
+    secret: context.env.FINALIZE_TICKET_SECRET || apiKey,
+    origin: new URL(context.request.url).origin,
+    ttlMs: 12 * 60 * 1000,
+  });
+  server.send(JSON.stringify({ sessionControl: { finalizeTicket } }));
 
   // 连接 Google 上游（Cloudflare 边缘出网，可访问 Google）
   const upstreamUrl = `${GEMINI_WS}?access_token=${encodeURIComponent(token)}`;

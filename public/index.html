@@ -7,7 +7,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>Meeting Live</title>
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/style.css?v=818f71aa" />
 </head>
 <body>
   <main class="app-shell">
@@ -22,6 +22,14 @@
     <section class="meeting-card">
       <label class="field-label" for="meetingTitle">会议名称</label>
       <input id="meetingTitle" class="title-input" type="text" placeholder="例如：广宁电厂现场会议" autocomplete="off" />
+
+      <div class="mode-row">
+        <label class="field-label" for="transcriptMode">转录模式</label>
+        <select id="transcriptMode" class="mode-select">
+          <option value="accurate" selected>实时草稿＋准确终稿（推荐）</option>
+          <option value="live">仅实时（不二次上传语音段）</option>
+        </select>
+      </div>
 
       <div class="status-row">
         <div class="recording-state">
@@ -59,11 +67,11 @@
       <button id="clearBtn" class="link-btn">清空记录</button>
     </section>
 
-    <footer class="footer-note">
-      音频实时发送至 Gemini Live API；文本同时保存在本机浏览器。
+    <footer id="privacyNote" class="footer-note">
+      实时音频发送至 Gemini Live API；准确模式会二次上传完整语音段，并附带最近5条已确认原文/译文作为上下文；结果文本保存在本机浏览器。
     </footer>
   </main>
 
-  <script type="module" src="/app.js?v=fb8c9bc0"></script>
+  <script type="module" src="/app.js?v=818f71aa"></script>
 </body>
 </html>

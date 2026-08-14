@@ -1,11 +1,11 @@
 import { readFile } from 'node:fs/promises';
 import { WebSocket } from 'undici';
 
-const endpoint = process.env.MEETING_WS_URL || 'wss://mobile-meeting-live.pages.dev/ws';
+const endpoint = process.env.MEETING_WS_URL;
 const audioPath = process.argv[2];
 
-if (!audioPath) {
-  console.error('Usage: node scripts/verify-ws.mjs <16kHz-mono-PCM-or-WAV-file>');
+if (!endpoint || !audioPath) {
+  console.error('Usage: MEETING_WS_URL=wss://<preview-host>/ws node scripts/verify-ws.mjs <16kHz-mono-PCM-or-WAV-file>');
   process.exit(2);
 }
 
@@ -37,7 +37,7 @@ function finish(error) {
   clearTimeout(timeout);
   try { socket.close(); } catch {}
   if (error) {
-    console.error(`FAIL: ${error.message} setupComplete=${setupComplete} messages=${received}`);
+    console.error(`FAIL: ${error.message} setupComplete=${setupComplete} messages=${received} transcription=${JSON.stringify(transcription)} translation=${JSON.stringify(translation)}`);
     process.exitCode = 1;
   } else {
     console.log(`PASS: setupComplete + inputTranscription + outputTranscription (${transcription} -> ${translation})`);
@@ -45,13 +45,13 @@ function finish(error) {
 }
 
 function sendAudioInChunks() {
-  const chunkBytes = 1280; // 40ms of 16kHz, 16-bit mono PCM
+  const chunkBytes = 3200; // 100ms of 16kHz, 16-bit mono PCM
   let offset = 0;
   const interval = setInterval(() => {
     if (socket.readyState !== WebSocket.OPEN) return clearInterval(interval);
     if (offset >= pcm.length) {
       clearInterval(interval);
-      socket.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+      socket.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
       return;
     }
     const chunk = pcm.subarray(offset, offset + chunkBytes);
@@ -59,7 +59,7 @@ function sendAudioInChunks() {
     socket.send(JSON.stringify({ realtimeInput: {
       audio: { data: chunk.toString('base64'), mimeType: 'audio/pcm;rate=16000' }
     } }));
-  }, 40);
+  }, 100);
 }
 
 socket.addEventListener('open', () => {
@@ -71,8 +71,7 @@ socket.addEventListener('open', () => {
         translationConfig: { targetLanguageCode: 'zh-CN', echoTargetLanguage: true }
       },
       inputAudioTranscription: {},
-      outputAudioTranscription: {},
-      realtimeInputConfig: { automaticActivityDetection: { disabled: true } }
+      outputAudioTranscription: {}
     }
   }));
 });
@@ -83,7 +82,6 @@ socket.addEventListener('message', (event) => {
   const message = JSON.parse(text);
   if (message.setupComplete && !setupComplete) {
     setupComplete = true;
-    socket.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
     sendAudioInChunks();
   }
   if (message.serverContent?.inputTranscription?.text) {

@@ -1,3 +1,18 @@
+import { PcmChunker } from './lib/pcm-chunker.js';
+import { PcmSegmentRecorder, pcm16ToWav } from './lib/audio-segment.js';
+import { SegmentStore } from './lib/segment-store.js';
+import { LiveSegmentQueue } from './lib/live-segment-queue.js';
+import { VadState } from './lib/vad-state.js';
+import { waitForMeetingDrain } from './lib/async-utils.js';
+import { normalizeTranscriptMode, shouldRequestFinal } from './lib/transcription-mode.js';
+import { applyFinalResult } from './lib/final-result.js';
+import { formatSpeakerLabel } from './lib/speaker-label.js';
+import { AdaptiveEnergyVad } from './lib/adaptive-energy-vad.js';
+import { maxSegmentBytes, pcmBytesForMs, pcmDurationMs, PRE_ROLL_MS, VAD_WARMUP_MS } from './lib/segment-policy.js';
+import { shouldDisableExport } from './lib/export-state.js';
+import { PcmEnergyFramer } from './lib/pcm-energy-framer.js';
+import { LiveBoundaryTracker } from './lib/live-boundary-tracker.js';
+
 const els = {
   title: document.querySelector('#meetingTitle'),
   badge: document.querySelector('#connectionBadge'),
@@ -14,6 +29,8 @@ const els = {
   exportMd: document.querySelector('#exportMdBtn'),
   exportTxt: document.querySelector('#exportTxtBtn'),
   clear: document.querySelector('#clearBtn'),
+  mode: document.querySelector('#transcriptMode'),
+  privacy: document.querySelector('#privacyNote'),
 };
 
 const STORAGE_KEY = 'meeting-live:gemini:last-session:v1';
@@ -23,7 +40,10 @@ const TARGET_LANG = 'zh-CN'; // 目标语言：中文
 // 通过 Cloudflare Pages Function 代理（浏览器 → pages.dev/ws → Google），
 // 国内网络无需直连 Google WSS；token 由服务端生成并注入。
 const GEMINI_WS = '/ws';
+const FINALIZE_ENDPOINT = '/finalize';
 const RECONNECT_MS = 9 * 60 * 1000;
+const PCM_CHUNK_BYTES = 3200; // 100ms @ 16kHz, 16-bit mono
+const FINALIZE_TIMEOUT_MS = 20_000;
 
 let ws = null;
 let micStream = null;
@@ -39,16 +59,36 @@ let pausedAt = null;
 let isPaused = false;
 let isRunning = false;
 let isConnecting = false;
+let segmentStore = new SegmentStore();
 let entries = [];
 let sequence = 0;
 let currentTurnText = '';
 let currentTurnTranslation = '';
+let activeSegmentId = null;
+const liveSegmentQueue = new LiveSegmentQueue();
+const liveBoundaryTracker = new LiveBoundaryTracker();
+const liveSegmentTimers = new Map();
+let finalizingCount = 0;
+let finalizeTicket = '';
+const pcmChunker = new PcmChunker(PCM_CHUNK_BYTES);
+const segmentRecorder = new PcmSegmentRecorder({
+  preRollBytes: pcmBytesForMs({ milliseconds: PRE_ROLL_MS, sampleRate: 16_000, bytesPerSample: 2 }),
+  maxSegmentBytes: maxSegmentBytes({ sampleRate: 16_000, bytesPerSample: 2 }), // 最长15秒
+});
 let sessionSerial = 0;
 
-function nowClock() {
+function clockAt(timestamp = Date.now()) {
   return new Intl.DateTimeFormat('zh-CN', {
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-  }).format(new Date());
+  }).format(new Date(timestamp));
+}
+
+function nowClock() {
+  return clockAt();
+}
+
+function syncEntries() {
+  entries = segmentStore.toEntries();
 }
 
 function formatDuration(ms) {
@@ -74,6 +114,16 @@ function setConnection(text, state = 'idle') {
   els.badge.className = `badge ${state}`;
 }
 
+function updateModeUi() {
+  const mode = normalizeTranscriptMode(els.mode?.value);
+  if (els.mode) els.mode.value = mode;
+  if (els.privacy) {
+    els.privacy.textContent = mode === 'accurate'
+      ? '实时音频发送至 Gemini Live API；完整语音段会二次上传校对，并附带最近5条已确认原文/译文作为上下文；发言人标签仅为段内模型估计，结果文本保存在本机浏览器。'
+      : '仅实时模式：音频只发送至 Gemini Live API，不进行第二次语音段上传；文本保存在本机浏览器。';
+  }
+}
+
 function setUiState(mode) {
   const running = mode === 'running';
   const paused = mode === 'paused';
@@ -82,9 +132,11 @@ function setUiState(mode) {
   els.start.disabled = running || paused || isConnecting;
   els.pause.disabled = !(running || paused);
   els.stop.disabled = !(running || paused);
+  if (els.mode) els.mode.disabled = running || paused || isConnecting;
   els.pause.textContent = paused ? '继续' : '暂停';
-  els.exportMd.disabled = entries.length === 0;
-  els.exportTxt.disabled = entries.length === 0;
+  const exportBlocked = shouldDisableExport({ entryCount: entries.length, finalizingCount });
+  els.exportMd.disabled = exportBlocked;
+  els.exportTxt.disabled = exportBlocked;
 
   els.dot.className = 'record-dot';
   if (running) {
@@ -106,7 +158,7 @@ function renderEntries() {
 
   for (const entry of entries) {
     const row = document.createElement('div');
-    row.className = 'transcript-item';
+    row.className = `transcript-item ${entry.status || 'final'}`;
 
     const time = document.createElement('div');
     time.className = 'transcript-time';
@@ -114,7 +166,21 @@ function renderEntries() {
 
     const text = document.createElement('div');
     text.className = 'transcript-text';
-    text.textContent = entry.text;
+    const speakerLabel = formatSpeakerLabel(entry);
+    if (speakerLabel) {
+      const speaker = document.createElement('div');
+      speaker.className = 'transcript-speaker';
+      speaker.textContent = speakerLabel;
+      text.appendChild(speaker);
+    }
+    const source = document.createElement('div');
+    source.className = 'transcript-source';
+    source.textContent = entry.text || (entry.status === 'refining' ? '正在生成准确终稿…' : '[未识别]');
+    const status = document.createElement('span');
+    status.className = `transcript-status ${entry.status || 'final'}`;
+    status.textContent = entry.status === 'refining' ? '校对中' : entry.status === 'failed' ? '实时稿' : '已校对';
+    source.appendChild(status);
+    text.appendChild(source);
     if (entry.translation) {
       const trans = document.createElement('div');
       trans.className = 'transcript-translation';
@@ -142,14 +208,16 @@ function renderEntries() {
     els.partial.appendChild(t);
   }
   els.partial.classList.toggle('hidden', !partialText && !partialTrans);
-  els.exportMd.disabled = entries.length === 0;
-  els.exportTxt.disabled = entries.length === 0;
+  const exportBlocked = shouldDisableExport({ entryCount: entries.length, finalizingCount });
+  els.exportMd.disabled = exportBlocked;
+  els.exportTxt.disabled = exportBlocked;
   requestAnimationFrame(() => { els.panel.scrollTop = els.panel.scrollHeight; });
 }
 
 function persist() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
     title: els.title.value,
+    mode: normalizeTranscriptMode(els.mode?.value),
     entries,
     savedAt: new Date().toISOString()
   }));
@@ -161,7 +229,12 @@ function restore() {
     if (!raw) return;
     const data = JSON.parse(raw);
     if (typeof data.title === 'string') els.title.value = data.title;
-    if (Array.isArray(data.entries)) entries = data.entries;
+    if (els.mode) els.mode.value = normalizeTranscriptMode(data.mode);
+    updateModeUi();
+    if (Array.isArray(data.entries)) {
+      segmentStore.importEntries(data.entries);
+      syncEntries();
+    }
     sequence = entries.length;
     renderEntries();
   } catch (e) {
@@ -180,41 +253,98 @@ function mergeTranscript(prev, next) {
   return `${a}${/^[,，。.!！？?\s]/.test(b) ? '' : ' '}${b}`;
 }
 
-function commitCurrentTurn() {
-  const text = currentTurnText.trim();
+function clearLiveTimer(id) {
+  const timer = liveSegmentTimers.get(id);
+  if (timer) clearTimeout(timer);
+  liveSegmentTimers.delete(id);
+}
+
+function expireLiveSegment(id) {
+  clearLiveTimer(id);
+  return liveSegmentQueue.expire(id);
+}
+
+function enqueueLiveSegment(id, session) {
+  liveSegmentQueue.enqueue(id, session);
+  clearLiveTimer(id);
+  liveSegmentTimers.set(id, setTimeout(() => expireLiveSegment(id), 2500));
+}
+
+function completeLiveSegment(session) {
+  const id = liveSegmentQueue.complete(session);
+  if (id) clearLiveTimer(id);
+  return id;
+}
+
+function clearLiveSession(session) {
+  const ids = liveSegmentQueue.clearSession(session);
+  for (const id of ids) clearLiveTimer(id);
+  liveBoundaryTracker.clear(session);
+}
+
+function clearAllLiveSegments() {
+  for (const id of liveSegmentQueue.clear()) clearLiveTimer(id);
+  liveBoundaryTracker.clear();
+}
+
+function appendCurrentDraftToSegment(id) {
+  const source = currentTurnText.trim();
   const translation = currentTurnTranslation.trim();
   currentTurnText = '';
   currentTurnTranslation = '';
-  if (!text) {
-    renderEntries();
-    return;
-  }
-
-  const previous = entries.at(-1)?.text || '';
-  if (previous === text) {
-    renderEntries();
-    return;
-  }
-
-  entries.push({ id: `g-${Date.now()}-${sequence}`, seq: sequence++, time: nowClock(), text, translation });
+  if (source || translation) segmentStore.appendDraft(id, { source, translation });
+  syncEntries();
   persist();
   renderEntries();
 }
 
-// 兜底切句：Gemini 翻译模型不一定发 turnComplete，streamEnd 后若迟迟没有
-// turnComplete，则强制把当前已识别的句子落成一条记录（带时间戳）。
-let forcedCommitTimer = null;
-function scheduleForcedCommit() {
-  if (forcedCommitTimer) clearTimeout(forcedCommitTimer);
-  forcedCommitTimer = setTimeout(() => {
-    if (!isRunning) return;
-    if (currentTurnText.trim() || currentTurnTranslation.trim()) {
-      commitCurrentTurn();
-    }
-  }, 2000);
+function commitCurrentTurn() {
+  const text = currentTurnText.trim();
+  const translation = currentTurnTranslation.trim();
+  if (!text && !translation) {
+    renderEntries();
+    return;
+  }
+
+  // 正在录音时只显示草稿，等VAD结束后再用同一segment落条。
+  if (activeSegmentId) {
+    renderEntries();
+    return;
+  }
+
+  const liveTarget = liveSegmentQueue.target(sessionSerial);
+  if (liveTarget && segmentStore.get(liveTarget)) {
+    appendCurrentDraftToSegment(liveTarget);
+    return;
+  }
+
+  // 没有对应音频段时保留实时稿，但明确标记为未经过二次校对。
+  const id = `live-${Date.now()}-${sequence++}`;
+  segmentStore.create({ id, time: nowClock(), startedAt: Date.now() });
+  segmentStore.appendDraft(id, { source: text, translation });
+  segmentStore.markFailed(id, 'No captured audio segment');
+  currentTurnText = '';
+  currentTurnTranslation = '';
+  syncEntries();
+  persist();
+  renderEntries();
 }
 
-function handleGeminiMessage(message) {
+// 没有对应已封段segment的Live增量，保留短暂窗口后降级为“实时稿”。
+let orphanCommitTimer = null;
+function scheduleOrphanCommit() {
+  if (orphanCommitTimer) clearTimeout(orphanCommitTimer);
+  orphanCommitTimer = setTimeout(() => {
+    if (!isRunning || activeSegmentId || liveSegmentQueue.target(sessionSerial)) return;
+    if (currentTurnText.trim() || currentTurnTranslation.trim()) commitCurrentTurn();
+  }, 2500);
+}
+
+function handleGeminiMessage(message, serial = sessionSerial) {
+  if (message.sessionControl?.finalizeTicket) {
+    finalizeTicket = message.sessionControl.finalizeTicket;
+    return;
+  }
   if (message.setupComplete) {
     setConnection('已连接', 'live');
     return;
@@ -222,18 +352,29 @@ function handleGeminiMessage(message) {
 
   const content = message.serverContent;
   if (!content) return;
+  const source = content.inputTranscription?.text || '';
+  const translation = content.outputTranscription?.text || '';
+  const liveTarget = liveSegmentQueue.target(serial);
 
-  if (content.inputTranscription?.text) {
-    currentTurnText = mergeTranscript(currentTurnText, content.inputTranscription.text);
+  if ((source || translation) && liveTarget && segmentStore.get(liveTarget)) {
+    segmentStore.appendDraft(liveTarget, { source, translation });
+    syncEntries();
+    persist();
     renderEntries();
+  } else {
+    if (source) currentTurnText = mergeTranscript(currentTurnText, source);
+    if (translation) currentTurnTranslation = mergeTranscript(currentTurnTranslation, translation);
+    if (source || translation) {
+      renderEntries();
+      scheduleOrphanCommit();
+    }
   }
 
-  if (content.outputTranscription?.text) {
-    currentTurnTranslation = mergeTranscript(currentTurnTranslation, content.outputTranscription.text);
-    renderEntries();
+  if (content.turnComplete) {
+    liveBoundaryTracker.completed(serial);
+    if (liveTarget) completeLiveSegment(serial);
+    else commitCurrentTurn();
   }
-
-  if (content.turnComplete) commitCurrentTurn();
 }
 
 function bytesToBase64(uint8) {
@@ -249,48 +390,144 @@ function bytesToBase64(uint8) {
   return btoa(binary);
 }
 
+function sendPcmChunk(pcm) {
+  if (!pcm?.byteLength || ws?.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    realtimeInput: {
+      audio: {
+        data: bytesToBase64(pcm),
+        mimeType: 'audio/pcm;rate=16000'
+      }
+    }
+  }));
+  sentPackets += 1;
+  sentBytes += pcm.byteLength;
+  renderDiagnostics();
+}
+
+function startAccurateSegment(startedAt) {
+  if (activeSegmentId) return;
+  const id = `seg-${startedAt}-${sequence++}`;
+  const preRollMs = pcmDurationMs({
+    bytes: segmentRecorder.bufferedPreRollBytes,
+    sampleRate: 16_000,
+    bytesPerSample: 2,
+  });
+  const clipStartedAt = Math.max(0, startedAt - Math.round(preRollMs));
+  activeSegmentId = id;
+  segmentRecorder.start({ id, startedAt: clipStartedAt });
+}
+
+function previousFinalContext(segmentId) {
+  return segmentStore.toEntries()
+    .filter(entry => entry.id !== segmentId && entry.status === 'final' && entry.text)
+    .slice(-5)
+    .map(entry => ({ source: entry.text, translation: entry.translation }));
+}
+
+async function requestFinalTranscript(recorded) {
+  const store = segmentStore;
+  const segment = store.get(recorded.id);
+  if (!segment) return;
+  const wav = pcm16ToWav(recorded.pcm, 16000);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FINALIZE_TIMEOUT_MS);
+  finalizingCount += 1;
+  renderDiagnostics();
+
+  try {
+    const headers = { 'content-type': 'application/json' };
+    if (finalizeTicket) headers['x-finalize-ticket'] = finalizeTicket;
+    const response = await fetch(FINALIZE_ENDPOINT, {
+      method: 'POST',
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify({
+        segmentId: recorded.id,
+        audioBase64: bytesToBase64(wav),
+        mimeType: 'audio/wav',
+        draftSource: segment.sourceDraft,
+        previousContext: previousFinalContext(recorded.id),
+      }),
+    });
+    if (!response.ok) throw new Error(`终稿接口返回 ${response.status}`);
+    const result = await response.json();
+    if (result.segmentId !== recorded.id) throw new Error('终稿segmentId不匹配');
+    applyFinalResult(store, recorded.id, result);
+  } catch (error) {
+    console.warn('Accurate final transcript failed', recorded.id, error);
+    store.markFailed(recorded.id, error.name === 'AbortError' ? '终稿请求超时' : error.message);
+  } finally {
+    clearTimeout(timeout);
+    finalizingCount = Math.max(0, finalizingCount - 1);
+    if (store === segmentStore) {
+      syncEntries();
+      persist();
+      renderEntries();
+    }
+    renderDiagnostics();
+  }
+}
+
+function discardAccurateSegment(endedAt = Date.now()) {
+  if (!activeSegmentId) return;
+  activeSegmentId = null;
+  segmentRecorder.finish({ endedAt });
+}
+
+function closeAccurateSegment(endedAt = Date.now()) {
+  if (!activeSegmentId) return null;
+  const id = activeSegmentId;
+  activeSegmentId = null;
+  const recorded = segmentRecorder.finish({ endedAt });
+  if (!recorded) return null;
+
+  segmentStore.create({ id, time: clockAt(recorded.startedAt), startedAt: recorded.startedAt });
+  segmentStore.appendDraft(id, {
+    source: currentTurnText,
+    translation: currentTurnTranslation,
+  });
+  currentTurnText = '';
+  currentTurnTranslation = '';
+  enqueueLiveSegment(id, sessionSerial);
+  const accurateMode = shouldRequestFinal(els.mode?.value);
+  if (!accurateMode) segmentStore.markFailed(id, 'Live-only mode');
+  syncEntries();
+  persist();
+  renderEntries();
+  if (accurateMode) requestFinalTranscript(recorded);
+  return recorded;
+}
+
 // 前端 VAD：检测静音停顿，自动发送 audioStreamEnd 触发 Gemini 返回转录
-const VAD_SILENCE_MS = 500;   // 静音持续 500ms 视为句子结束（降低延迟）
-const VAD_MIN_SPEECH_MS = 200; // 至少 200ms 语音才值得切句
-let vadSpeaking = false;
-let vadSpeechStart = 0;
-let vadSilenceStart = 0;
-let vadLastPacket = 0;
-let vadNoiseFloor = 150;
+const VAD_SILENCE_MS = 800;   // 草稿实时显示；静音800ms再形成终稿，减少越南语半句切断
+const VAD_MIN_SPEECH_MS = 200; // 仅累计真正高于阈值的语音帧
+const vadState = new VadState({ silenceMs: VAD_SILENCE_MS, minVoicedMs: VAD_MIN_SPEECH_MS });
+const energyVad = new AdaptiveEnergyVad({ warmupMs: VAD_WARMUP_MS, historyMs: 12_000, recomputeIntervalMs: 250 });
+const energyFramer = new PcmEnergyFramer({ frameBytes: 1600, frameMs: 50 });
 
 function detectAndSendStreamEnd(pcm, isPaused) {
   if (isPaused || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-  const view = new Int16Array(pcm.buffer || pcm, pcm.byteOffset || 0, Math.floor(pcm.byteLength / 2));
-  let energy = 0;
-  for (let i = 0; i < view.length; i++) {
-    const v = Math.abs(view[i]);
-    energy += v;
-  }
-  energy /= Math.max(1, view.length);
+  for (const frame of energyFramer.push(pcm)) {
+    const now = Date.now();
+    const classified = energyVad.classify({
+      energy: frame.energy,
+      frameMs: frame.frameMs,
+      active: vadState.speaking,
+    });
+    const result = vadState.observe({ speaking: classified.speaking, now, frameMs: frame.frameMs });
 
-  const now = Date.now();
-  // 自适应阈值：跟踪环境底噪，说话阈值 = 底噪×2（下限 250），避免固定 400 在嘈杂环境误判
-  if (!vadSpeaking) vadNoiseFloor = vadNoiseFloor * 0.92 + energy * 0.08;
-  const THRESHOLD = Math.max(250, vadNoiseFloor * 2);
-  const speaking = energy >= THRESHOLD;
+    if (result.started) startAccurateSegment(now);
+    if (!result.ended) continue;
 
-  if (speaking && !vadSpeaking) {
-    vadSpeaking = true;
-    vadSpeechStart = now;
-    vadSilenceStart = 0;
-  } else if (!speaking && vadSpeaking) {
-    if (!vadSilenceStart) vadSilenceStart = now;
-    if (now - vadSilenceStart >= VAD_SILENCE_MS) {
-      if (now - vadSpeechStart >= VAD_MIN_SPEECH_MS) {
-        // 一句说完：发 streamEnd 让 Gemini 输出转录
-        sendAudioStreamEnd();
-      }
-      vadSpeaking = false;
-      vadSilenceStart = 0;
+    if (result.accepted) {
+      // 同一语音段：先封存音频并创建segment，再通知Live输出草稿。
+      closeAccurateSegment(now);
+      sendAudioStreamEnd();
+    } else {
+      discardAccurateSegment(now);
     }
-  } else if (speaking) {
-    vadSilenceStart = 0;
   }
 }
 let micLevel = 0;
@@ -318,7 +555,10 @@ function updateMicLevel(pcm) {
 function renderDiagnostics() {
   const el = document.getElementById('diagInfo');
   if (!el) return;
-  el.textContent = `音频↑${sentPackets}包/${(sentBytes / 1024).toFixed(1)}KB · 服务端消息↓${recvMessages}`;
+  el.textContent = `音频↑${sentPackets}包/${(sentBytes / 1024).toFixed(1)}KB · 服务端消息↓${recvMessages} · 终稿处理中${finalizingCount}`;
+  const exportBlocked = shouldDisableExport({ entryCount: entries.length, finalizingCount });
+  els.exportMd.disabled = exportBlocked;
+  els.exportTxt.disabled = exportBlocked;
 }
 
 async function fetchToken() {
@@ -331,11 +571,22 @@ async function fetchToken() {
 }
 
 function sendAudioStreamEnd() {
+  const remainder = pcmChunker.flush();
+  if (remainder.byteLength) sendPcmChunk(remainder);
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+    liveBoundaryTracker.sent(sessionSerial);
   }
-  // streamEnd 已发出：2 秒内若无 turnComplete，前端强制切句落条
-  scheduleForcedCommit();
+  scheduleOrphanCommit();
+}
+
+function forceAudioBoundary({ notifyLive = true, endedAt = Date.now() } = {}) {
+  if (activeSegmentId) closeAccurateSegment(endedAt);
+  if (notifyLive) sendAudioStreamEnd();
+  else pcmChunker.reset();
+  vadState.reset();
+  energyVad.reset();
+  energyFramer.reset();
 }
 
 async function decodeGeminiFrame(data) {
@@ -358,6 +609,7 @@ async function connectGemini({ reconnect = false } = {}) {
   setUiState(isPaused ? 'paused' : (isRunning ? 'running' : 'idle'));
 
   const serial = ++sessionSerial;
+  finalizeTicket = '';
 
   try {
     const { token } = await fetchToken();
@@ -371,10 +623,12 @@ async function connectGemini({ reconnect = false } = {}) {
 
     // 必须在发送 setup 之前注册，避免移动网络下 setupComplete 到达过快而丢失。
     socket.addEventListener('message', async (event) => {
-      recvMessages += 1;
-      renderDiagnostics();
       try {
-        handleGeminiMessage(JSON.parse(await decodeGeminiFrame(event.data)));
+        const decoded = await decodeGeminiFrame(event.data);
+        if (serial !== sessionSerial || socket !== ws) return;
+        recvMessages += 1;
+        renderDiagnostics();
+        handleGeminiMessage(JSON.parse(decoded), serial);
       } catch (error) {
         console.warn('Bad Gemini message', error);
       }
@@ -382,9 +636,14 @@ async function connectGemini({ reconnect = false } = {}) {
 
     socket.addEventListener('close', () => {
       if (serial !== sessionSerial || !isRunning) return;
+      // 断线期间的音频不会送达上游，因此把旧会话原子封段并从新会话隔离。
+      forceAudioBoundary({ notifyLive: false });
+      clearLiveSession(serial);
+      if (ws === socket) ws = null;
+      const reconnectGuard = ++sessionSerial;
       setConnection('连接断开', 'error');
       window.setTimeout(() => {
-        if (isRunning && serial === sessionSerial) connectGemini({ reconnect: true }).catch(console.error);
+        if (isRunning && reconnectGuard === sessionSerial) connectGemini({ reconnect: true }).catch(console.error);
       }, 1200);
     });
 
@@ -428,7 +687,9 @@ async function connectGemini({ reconnect = false } = {}) {
     if (reconnectId) clearTimeout(reconnectId);
     reconnectId = window.setTimeout(async () => {
       if (!isRunning) return;
-      commitCurrentTurn();
+      const oldSession = sessionSerial;
+      forceAudioBoundary();
+      clearLiveSession(oldSession);
       sessionSerial += 1;
       try { ws?.close(); } catch {}
       ws = null;
@@ -467,20 +728,17 @@ async function startAudioCapture() {
   processorNode.port.onmessage = (event) => {
     if (!isRunning || isPaused || !ws || ws.readyState !== WebSocket.OPEN) return;
     const pcm = new Uint8Array(event.data);
+    const recordingState = segmentRecorder.push(pcm);
     updateMicLevel(event.data);
+    for (const chunk of pcmChunker.push(pcm)) sendPcmChunk(chunk);
+    if (recordingState.full && activeSegmentId) {
+      closeAccurateSegment(Date.now());
+      sendAudioStreamEnd();
+      vadState.reset();
+      energyFramer.reset(); // 保留整场底噪历史，只丢弃跨segment的未完成分析帧
+      return;
+    }
     detectAndSendStreamEnd(event.data, isPaused);
-    sentPackets += 1;
-    sentBytes += pcm.byteLength;
-    renderDiagnostics();
-    const msg = JSON.stringify({
-      realtimeInput: {
-        audio: {
-          data: bytesToBase64(pcm),
-          mimeType: 'audio/pcm;rate=16000'
-        }
-      }
-    });
-    ws.send(msg);
   };
 
   sourceNode.connect(processorNode);
@@ -493,6 +751,18 @@ async function startMeeting() {
   if (isRunning || isConnecting) return;
   isRunning = true;
   isPaused = false;
+  pcmChunker.reset();
+  segmentRecorder.reset();
+  activeSegmentId = null;
+  clearAllLiveSegments();
+  if (orphanCommitTimer) clearTimeout(orphanCommitTimer);
+  orphanCommitTimer = null;
+  vadState.reset();
+  energyVad.reset();
+  energyFramer.reset();
+  sentPackets = 0;
+  sentBytes = 0;
+  recvMessages = 0;
   startedAt = Date.now();
   elapsedBeforePause = 0;
   pausedAt = null;
@@ -521,9 +791,8 @@ async function togglePause() {
   if (!isPaused) {
     isPaused = true;
     pausedAt = Date.now();
-    sendAudioStreamEnd();
+    forceAudioBoundary({ endedAt: pausedAt });
     micStream.getAudioTracks().forEach(t => { t.enabled = false; });
-    commitCurrentTurn();
     setUiState('paused');
   } else {
     if (pausedAt) elapsedBeforePause += Date.now() - pausedAt;
@@ -537,16 +806,23 @@ async function togglePause() {
 }
 
 async function cleanupConnection() {
-  if (forcedCommitTimer) clearTimeout(forcedCommitTimer);
+  if (orphanCommitTimer) clearTimeout(orphanCommitTimer);
+  orphanCommitTimer = null;
   if (timerId) clearInterval(timerId);
   if (reconnectId) clearTimeout(reconnectId);
   timerId = null;
   reconnectId = null;
   sessionSerial += 1;
 
-  try { sendAudioStreamEnd(); } catch {}
   try { ws?.close(); } catch {}
   ws = null;
+  pcmChunker.reset();
+  segmentRecorder.reset();
+  activeSegmentId = null;
+  vadState.reset();
+  energyVad.reset();
+  energyFramer.reset();
+  clearAllLiveSegments();
 
   try { sourceNode?.disconnect(); } catch {}
   try { processorNode?.disconnect(); } catch {}
@@ -567,9 +843,20 @@ async function cleanupConnection() {
 async function stopMeeting() {
   if (!isRunning) return;
   updateTimer();
+  isPaused = true;
+  micStream?.getAudioTracks().forEach(track => { track.enabled = false; });
+  const drainSession = sessionSerial;
+  forceAudioBoundary();
+  setConnection('正在收尾并等待终稿…');
+  await waitForMeetingDrain({
+    hasLivePending: () => Boolean(liveSegmentQueue.target(drainSession))
+      || liveBoundaryTracker.hasPending(drainSession),
+    hasFinalPending: () => finalizingCount > 0,
+    liveTimeoutMs: 3500,
+    finalTimeoutMs: FINALIZE_TIMEOUT_MS + 1000,
+  });
   commitCurrentTurn();
   isRunning = false;
-  isPaused = false;
   await cleanupConnection();
   persist();
   setConnection('已结束');
@@ -585,13 +872,21 @@ function safeFilename() {
 function buildMarkdown() {
   const title = (els.title.value || '会议记录').trim();
   const lines = [`# ${title}`, '', `导出时间：${new Date().toLocaleString('zh-CN')}`, '', '## 实时记录', ''];
-  for (const item of entries) lines.push(`**${item.time}**`, '', item.text, '');
+  for (const item of entries) {
+    const speaker = formatSpeakerLabel(item);
+    lines.push(`**${item.time}${speaker ? ` · ${speaker}` : ''}**`, '', item.text || '[未识别]');
+    if (item.translation) lines.push('', `🌐 ${item.translation}`);
+    lines.push('');
+  }
   return lines.join('\n');
 }
 
 function buildText() {
   const title = (els.title.value || '会议记录').trim();
-  return [title, `导出时间：${new Date().toLocaleString('zh-CN')}`, '', ...entries.map(item => `[${item.time}] ${item.text}${item.translation ? `\n🌐 ${item.translation}` : ''}`)].join('\n');
+  return [title, `导出时间：${new Date().toLocaleString('zh-CN')}`, '', ...entries.map(item => {
+    const speaker = formatSpeakerLabel(item);
+    return `[${item.time}]${speaker ? ` [${speaker}]` : ''} ${item.text}${item.translation ? `\n🌐 ${item.translation}` : ''}`;
+  })].join('\n');
 }
 
 function download(text, filename, mime) {
@@ -609,9 +904,11 @@ function download(text, filename, mime) {
 function clearTranscript() {
   if (isRunning) return alert('请先结束当前会议。');
   if (entries.length && !confirm('确定清空本机保存的会议记录？')) return;
+  segmentStore = new SegmentStore();
   entries = [];
   sequence = 0;
   currentTurnText = '';
+  currentTurnTranslation = '';
   localStorage.removeItem(STORAGE_KEY);
   els.title.value = '';
   els.timer.textContent = '00:00:00';
@@ -629,6 +926,10 @@ els.exportMd.addEventListener('click', () => download(buildMarkdown(), `${safeFi
 els.exportTxt.addEventListener('click', () => download(buildText(), `${safeFilename()}.txt`, 'text/plain'));
 els.clear.addEventListener('click', clearTranscript);
 els.title.addEventListener('input', persist);
+els.mode?.addEventListener('change', () => {
+  updateModeUi();
+  persist();
+});
 
 window.addEventListener('beforeunload', () => {
   persist();
@@ -636,4 +937,5 @@ window.addEventListener('beforeunload', () => {
 });
 
 restore();
+updateModeUi();
 setUiState('idle');

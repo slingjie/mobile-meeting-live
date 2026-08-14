@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setGlobalDispatcher, EnvHttpProxyAgent } from 'undici';
+import { finalizeAudio } from './functions/finalize.js';
 
 // 若设置了 HTTP(S)_PROXY / ALL_PROXY（如本机 Clash 7890），
 // 让内置 fetch 走代理，否则直连 Google API 会被墙。
@@ -37,6 +38,7 @@ async function loadEnvFile() {
 await loadEnvFile();
 
 const port = Number(process.env.PORT || 3000);
+const host = process.env.HOST || '127.0.0.1';
 const apiKey = process.env.GEMINI_API_KEY;
 
 const mimeTypes = {
@@ -55,6 +57,17 @@ function send(res, status, body, contentType = 'text/plain; charset=utf-8') {
     'Cache-Control': 'no-store'
   });
   res.end(body);
+}
+
+async function readJsonBody(req, maxBytes = 4_000_000) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.byteLength;
+    if (total > maxBytes) throw new RangeError('Request body is too large');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
 async function createEphemeralToken() {
@@ -105,6 +118,27 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === 'POST' && url.pathname === '/finalize') {
+      try {
+        const payload = await readJsonBody(req);
+        const result = await finalizeAudio({
+          payload,
+          apiKey,
+          model: process.env.FINAL_TRANSCRIPT_MODEL || 'gemini-3.1-flash-lite',
+        });
+        return send(res, 200, JSON.stringify(result), 'application/json; charset=utf-8');
+      } catch (error) {
+        const clientError = error instanceof TypeError || error instanceof RangeError || error instanceof SyntaxError;
+        if (!clientError) console.error(error);
+        return send(
+          res,
+          clientError ? 400 : 502,
+          JSON.stringify({ error: clientError ? error.message : 'Final transcription failed' }),
+          'application/json; charset=utf-8',
+        );
+      }
+    }
+
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return send(res, 405, 'Method Not Allowed');
     }
@@ -129,6 +163,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, '0.0.0.0', () => {
-  console.log(`Mobile Meeting Live (Gemini) running on http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`Mobile Meeting Live (Gemini) running on http://${host}:${port}`);
 });
