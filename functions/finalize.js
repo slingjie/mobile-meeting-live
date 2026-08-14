@@ -23,25 +23,51 @@ function compactContext(items) {
   }));
 }
 
+function compactList(items, maxLen = 30) {
+  if (!items) return [];
+  if (Array.isArray(items)) {
+    return items.map(s => String(s || '').trim()).filter(Boolean).slice(0, maxLen);
+  }
+  if (typeof items === 'string') {
+    return items.split(/[,，\n]/).map(s => s.trim()).filter(Boolean).slice(0, maxLen);
+  }
+  return [];
+}
+
 function buildInstruction(payload) {
   const context = compactContext(payload.previousContext);
-  return `You are a strict multilingual meeting transcription editor.\n\n` +
-    `The audio may contain Vietnamese, Mandarin Chinese, English, or rapid code-switching. ` +
+  const hotwords = compactList(payload.hotwords);
+  const participants = compactList(payload.participants);
+  const meetingTitle = String(payload.meetingTitle || '').trim().slice(0, 200);
+
+  let instruction = `You are a strict, faithful multilingual meeting transcription and translation engine.\n\n` +
+    `The audio may contain Vietnamese, Mandarin Chinese, English, or rapid code-switching.\n` +
     `Transcribe the COMPLETE audio verbatim in its original language, then translate it faithfully into Simplified Chinese.\n\n` +
-    `Rules:\n` +
-    `1. Audio is authoritative. The live draft and context are hints only.\n` +
-    `2. Preserve every number, unit, name, project, company, model, voltage and capacity exactly.\n` +
-    `3. Do not invent missing words or silently repair unclear speech. Use [听不清] in source and translation when needed.\n` +
-    `4. Vietnamese relationship words and pronouns can be ambiguous; do not guess gender or kinship without evidence.\n` +
-    `5. Use natural Chinese while preserving meaning. Remove only meaningless fillers; do not summarize.\n` +
-    `6. Split the audio into utterances at actual speaker changes or semantic sentence boundaries. Keep short replies such as \"Ừ\", \"Được\" and \"Đúng rồi\" as separate utterances when they are separate turns.\n` +
-    `7. Speaker labels are local to this audio segment only. Use S1, S2, ... only when the voice change is audible; otherwise use unknown. Do not identify speakers by name and do not infer speakers from wording alone.\n` +
-    `8. Estimate monotonic startMs/endMs offsets from the beginning of this audio clip. These are approximate utterance-level boundaries, not word timestamps.\n` +
-    `9. Every offset must stay within the provided audio duration.\n` +
-    `10. Relevant terminology may include photovoltaic, battery energy storage, EPC, grid connection, EMS, PCS, BMS, SCADA, commissioning, acceptance, fire protection, kV, MW and MWh.\n\n` +
-    `Audio duration: ${payload.audioDurationMs}ms\n` +
+    `CRITICAL VERBATIM & ANTI-HALLUCINATION RULES:\n` +
+    `1. Audio is the ONLY source of truth. Live drafts and prior context are hints only. Never invent, infer, extrapolate, or hallucinate words not audibly spoken in this audio segment.\n` +
+    `2. Do not autocomplete unfinished sentences or repair broken speech. If speech is unintelligible, quiet, or muffled, write [听不清] in source and translation and set uncertain=true.\n` +
+    `3. Preserve numbers, units, project names, company names, electrical parameters (kV, MW, MWh, Hz) verbatim.\n` +
+    `4. Keep short replies and affirmations ("Ừ", "Dạ", "Được", "Đúng rồi", "对", "好的", "OK") as separate utterances when spoken as separate turns.\n` +
+    `5. Split audio into utterances at audible speaker transitions or natural sentence boundaries.\n` +
+    `6. Speaker labels (S1, S2, ...) are local to this segment only. Use S1/S2 only when a voice change is clearly audible; otherwise use unknown. Do not identify speakers by name.\n` +
+    `7. Estimate monotonic startMs/endMs offsets within the audio clip. All timestamps must be clamped within 0 to ${payload.audioDurationMs}ms.\n` +
+    `8. Provide natural, idiomatic Simplified Chinese translation. Translate electrical & energy storage terms accurately.\n`;
+
+  if (meetingTitle) {
+    instruction += `\nMeeting topic: ${meetingTitle}\n`;
+  }
+  if (participants.length > 0) {
+    instruction += `Known participants: ${participants.join(', ')}\n`;
+  }
+  if (hotwords.length > 0) {
+    instruction += `Domain hotwords & terminology hints: ${hotwords.join(', ')}\n(Note: only output these terms if they are actually pronounced in the audio)\n`;
+  }
+
+  instruction += `\nAudio duration: ${payload.audioDurationMs}ms\n` +
     `Live draft: ${JSON.stringify(String(payload.draftSource || '').slice(0, 1000))}\n` +
     `Previous finalized context: ${JSON.stringify(context)}`;
+
+  return instruction;
 }
 
 export async function readJsonBody(request, maxBytes = MAX_REQUEST_BYTES) {

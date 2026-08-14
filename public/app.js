@@ -12,6 +12,8 @@ import { maxSegmentBytes, pcmBytesForMs, pcmDurationMs, PRE_ROLL_MS, VAD_WARMUP_
 import { shouldDisableExport } from './lib/export-state.js';
 import { PcmEnergyFramer } from './lib/pcm-energy-framer.js';
 import { LiveBoundaryTracker } from './lib/live-boundary-tracker.js';
+import { normalizeAudioCaptureMode, getAudioConstraints, formatTrackSettings } from './lib/audio-capture-mode.js';
+import { SampleLedger } from './lib/sample-ledger.js';
 
 const els = {
   title: document.querySelector('#meetingTitle'),
@@ -30,6 +32,11 @@ const els = {
   exportTxt: document.querySelector('#exportTxtBtn'),
   clear: document.querySelector('#clearBtn'),
   mode: document.querySelector('#transcriptMode'),
+  captureMode: document.querySelector('#audioCaptureMode'),
+  participants: document.querySelector('#participants'),
+  hotwords: document.querySelector('#hotwords'),
+  trackSettingsBadge: document.querySelector('#trackSettingsBadge'),
+  ledgerWarning: document.querySelector('#ledgerWarning'),
   privacy: document.querySelector('#privacyNote'),
 };
 
@@ -75,6 +82,7 @@ const segmentRecorder = new PcmSegmentRecorder({
   preRollBytes: pcmBytesForMs({ milliseconds: PRE_ROLL_MS, sampleRate: 16_000, bytesPerSample: 2 }),
   maxSegmentBytes: maxSegmentBytes({ sampleRate: 16_000, bytesPerSample: 2 }), // 最长15秒
 });
+const sampleLedger = new SampleLedger({ sampleRate: 16_000 });
 let sessionSerial = 0;
 
 function clockAt(timestamp = Date.now()) {
@@ -216,7 +224,10 @@ function renderEntries() {
 
 function persist() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
-    title: els.title.value,
+    title: els.title?.value || '',
+    captureMode: normalizeAudioCaptureMode(els.captureMode?.value),
+    participants: els.participants?.value || '',
+    hotwords: els.hotwords?.value || '',
     mode: normalizeTranscriptMode(els.mode?.value),
     entries,
     savedAt: new Date().toISOString()
@@ -228,7 +239,10 @@ function restore() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     const data = JSON.parse(raw);
-    if (typeof data.title === 'string') els.title.value = data.title;
+    if (typeof data.title === 'string' && els.title) els.title.value = data.title;
+    if (els.captureMode) els.captureMode.value = normalizeAudioCaptureMode(data.captureMode);
+    if (typeof data.participants === 'string' && els.participants) els.participants.value = data.participants;
+    if (typeof data.hotwords === 'string' && els.hotwords) els.hotwords.value = data.hotwords;
     if (els.mode) els.mode.value = normalizeTranscriptMode(data.mode);
     updateModeUi();
     if (Array.isArray(data.entries)) {
@@ -448,6 +462,9 @@ async function requestFinalTranscript(recorded) {
         mimeType: 'audio/wav',
         draftSource: segment.sourceDraft,
         previousContext: previousFinalContext(recorded.id),
+        meetingTitle: els.title?.value || '',
+        participants: els.participants?.value || '',
+        hotwords: els.hotwords?.value || '',
       }),
     });
     if (!response.ok) throw new Error(`终稿接口返回 ${response.status}`);
@@ -500,8 +517,8 @@ function closeAccurateSegment(endedAt = Date.now()) {
 }
 
 // 前端 VAD：检测静音停顿，自动发送 audioStreamEnd 触发 Gemini 返回转录
-const VAD_SILENCE_MS = 800;   // 草稿实时显示；静音800ms再形成终稿，减少越南语半句切断
-const VAD_MIN_SPEECH_MS = 200; // 仅累计真正高于阈值的语音帧
+const VAD_SILENCE_MS = 900;   // 会议静音900ms再形成终稿，保护连续发言与短暂停顿
+const VAD_MIN_SPEECH_MS = 150; // 累计150ms有效语音帧，确保短应答（如"Dạ"、"对"）不被漏录
 const vadState = new VadState({ silenceMs: VAD_SILENCE_MS, minVoicedMs: VAD_MIN_SPEECH_MS });
 const energyVad = new AdaptiveEnergyVad({ warmupMs: VAD_WARMUP_MS, historyMs: 12_000, recomputeIntervalMs: 250 });
 const energyFramer = new PcmEnergyFramer({ frameBytes: 1600, frameMs: 50 });
@@ -554,8 +571,18 @@ function updateMicLevel(pcm) {
 
 function renderDiagnostics() {
   const el = document.getElementById('diagInfo');
-  if (!el) return;
-  el.textContent = `音频↑${sentPackets}包/${(sentBytes / 1024).toFixed(1)}KB · 服务端消息↓${recvMessages} · 终稿处理中${finalizingCount}`;
+  if (el) {
+    el.textContent = `音频↑${sentPackets}包/${(sentBytes / 1024).toFixed(1)}KB · 服务端消息↓${recvMessages} · 终稿处理中${finalizingCount}`;
+  }
+  if (els.ledgerWarning) {
+    const telemetry = sampleLedger.getTelemetry();
+    if (telemetry.hasWarning) {
+      els.ledgerWarning.textContent = telemetry.warningText;
+      els.ledgerWarning.classList.remove('hidden');
+    } else {
+      els.ledgerWarning.classList.add('hidden');
+    }
+  }
   const exportBlocked = shouldDisableExport({ entryCount: entries.length, finalizingCount });
   els.exportMd.disabled = exportBlocked;
   els.exportTxt.disabled = exportBlocked;
@@ -704,14 +731,17 @@ async function connectGemini({ reconnect = false } = {}) {
 }
 
 async function startAudioCapture() {
+  const mode = normalizeAudioCaptureMode(els.captureMode?.value);
+  const constraints = getAudioConstraints(mode);
   micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 1
-    }
+    audio: constraints
   });
+
+  const track = micStream.getAudioTracks()[0];
+  const settings = track?.getSettings();
+  if (els.trackSettingsBadge) {
+    els.trackSettingsBadge.textContent = formatTrackSettings(settings, mode);
+  }
 
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   audioContext = new AudioContextClass();
@@ -728,6 +758,7 @@ async function startAudioCapture() {
   processorNode.port.onmessage = (event) => {
     if (!isRunning || isPaused || !ws || ws.readyState !== WebSocket.OPEN) return;
     const pcm = new Uint8Array(event.data);
+    sampleLedger.addBytes(pcm.byteLength);
     const recordingState = segmentRecorder.push(pcm);
     updateMicLevel(event.data);
     for (const chunk of pcmChunker.push(pcm)) sendPcmChunk(chunk);
@@ -764,6 +795,8 @@ async function startMeeting() {
   sentBytes = 0;
   recvMessages = 0;
   startedAt = Date.now();
+  sampleLedger.start(startedAt);
+  if (els.ledgerWarning) els.ledgerWarning.classList.add('hidden');
   elapsedBeforePause = 0;
   pausedAt = null;
   setUiState('running');
@@ -925,7 +958,10 @@ els.stop.addEventListener('click', stopMeeting);
 els.exportMd.addEventListener('click', () => download(buildMarkdown(), `${safeFilename()}.md`, 'text/markdown'));
 els.exportTxt.addEventListener('click', () => download(buildText(), `${safeFilename()}.txt`, 'text/plain'));
 els.clear.addEventListener('click', clearTranscript);
-els.title.addEventListener('input', persist);
+els.title?.addEventListener('input', persist);
+els.participants?.addEventListener('input', persist);
+els.hotwords?.addEventListener('input', persist);
+els.captureMode?.addEventListener('change', persist);
 els.mode?.addEventListener('change', () => {
   updateModeUi();
   persist();

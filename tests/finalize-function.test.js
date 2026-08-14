@@ -100,6 +100,54 @@ test('sends the complete WAV segment to Gemini and returns structured final text
   assert.match(sent.contents[0].parts[0].text, /Audio duration: 200ms/);
 });
 
+test('includes meetingTitle, participants, and hotwords in Gemini prompt when provided', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify({
+      candidates: [{ content: { parts: [{ text: JSON.stringify({
+        utterances: [
+          {
+            startMs: 0,
+            endMs: 200,
+            speaker: 'S1',
+            source: 'Kiểm tra trạm biến áp Pengding 35MW.',
+            translation: '检查鹏鼎 35MW 变电站。',
+            uncertain: false,
+          },
+        ],
+        language: 'vi',
+        uncertain: false,
+      }) }] } }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await finalizeAudio({
+    payload: {
+      segmentId: 's-meeting-1',
+      audioBase64: Buffer.from(pcm16ToWav(new Uint8Array(6400))).toString('base64'),
+      mimeType: 'audio/wav',
+      meetingTitle: '鹏鼎 35MW 储能电站调试会',
+      participants: ['戴总', '孙宇', '阮工'],
+      hotwords: ['鹏鼎', 'PCS', 'BMS', '35MW/87.5MWh', '并网柜'],
+    },
+    apiKey: 'test-key',
+    fetchImpl,
+  });
+
+  assert.equal(calls.length, 1);
+  const sent = JSON.parse(calls[0].options.body);
+  const prompt = sent.contents[0].parts[0].text;
+
+  assert.match(prompt, /Meeting topic: 鹏鼎 35MW 储能电站调试会/);
+  assert.match(prompt, /Known participants: 戴总, 孙宇, 阮工/);
+  assert.match(prompt, /Domain hotwords & terminology hints: 鹏鼎, PCS, BMS, 35MW\/87\.5MWh, 并网柜/);
+  assert.match(prompt, /CRITICAL VERBATIM & ANTI-HALLUCINATION RULES/);
+  assert.equal(result.utterances[0].source, 'Kiểm tra trạm biến áp Pengding 35MW.');
+  assert.equal(result.utterances[0].translation, '检查鹏鼎 35MW 变电站。');
+});
+
+
 test('endpoint rejects malformed JSON without exposing server details', async () => {
   const response = await onRequestPost({
     request: new Request('https://example.test/finalize', {

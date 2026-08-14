@@ -1,5 +1,5 @@
 export class VadState {
-  constructor({ silenceMs = 800, minVoicedMs = 200 } = {}) {
+  constructor({ silenceMs = 900, minVoicedMs = 150 } = {}) {
     this.silenceMs = silenceMs;
     this.minVoicedMs = minVoicedMs;
     this.reset();

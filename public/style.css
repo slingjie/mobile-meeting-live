@@ -42,12 +42,67 @@ h1 { margin: 4px 0 0; font-size: 24px; letter-spacing: -.03em; }
   background: #171c22; color: #f5f7fa; font-size: 16px;
 }
 .title-input::placeholder { color: #66717e; }
-.mode-row { margin-top: 12px; }
+.mode-row { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 540px) {
+  .mode-row { grid-template-columns: 1fr; gap: 8px; }
+}
 .mode-select {
   width: 100%; border: 1px solid #29313b; outline: 0; border-radius: 12px; padding: 11px 12px;
   background: #171c22; color: #dce5ee; font-size: 14px;
 }
 .mode-select:disabled { opacity: .55; }
+
+.meeting-preset-details {
+  margin-top: 12px;
+  border: 1px solid #222933;
+  border-radius: 12px;
+  background: #13171d;
+  overflow: hidden;
+}
+.preset-summary {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: #94a3b8;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 500;
+}
+.preset-summary:hover { color: #cbd5e1; }
+.preset-body {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid #1e242d;
+}
+.preset-input, .preset-textarea {
+  width: 100%; border: 1px solid #2a333f; outline: 0; border-radius: 8px; padding: 8px 10px;
+  background: #171c22; color: #f5f7fa; font-size: 13px; font-family: inherit; resize: vertical;
+}
+.preset-input::placeholder, .preset-textarea::placeholder { color: #64748b; }
+
+.track-settings-badge {
+  margin-top: 8px;
+  font-size: 11px;
+  color: #7dd3fc;
+  background: rgba(125, 211, 252, 0.08);
+  padding: 4px 8px;
+  border-radius: 6px;
+  display: inline-block;
+  font-family: ui-monospace, monospace;
+}
+.track-settings-badge:empty { display: none; }
+
+.ledger-warning {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(234, 179, 8, 0.12);
+  border: 1px solid rgba(234, 179, 8, 0.3);
+  color: #fde047;
+  font-size: 12px;
+  line-height: 1.4;
+}
 
 .status-row { margin-top: 13px; display: flex; align-items: center; justify-content: space-between; }
 .recording-state { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #aab4c0; }

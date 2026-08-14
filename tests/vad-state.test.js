@@ -39,3 +39,10 @@ test('accepts a segment only after enough above-threshold audio frames', () => {
   assert.equal(result.accepted, true);
   assert.equal(result.voicedMs, 200);
 });
+
+test('default constructor uses meeting-tuned defaults (900ms silence, 150ms minVoiced)', () => {
+  const vad = new VadState();
+  assert.equal(vad.silenceMs, 900);
+  assert.equal(vad.minVoicedMs, 150);
+});
+
