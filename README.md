@@ -94,8 +94,8 @@ openssl rand -hex 32 | npx wrangler pages secret put FINALIZE_TICKET_SECRET --pr
 ### 4. 验证部署
 
 ```bash
-# 健康检查
-curl https://<your-project>.pages.dev/health
+# 页面可达性检查（应返回 HTTP 200）
+curl -I https://<your-project>.pages.dev/
 
 # 全链路验证（需要一段 16kHz 单声道 PCM 音频）
 MEETING_WS_URL='wss://<your-preview-host>/ws' node scripts/verify-ws.mjs /path/to/audio.pcm
