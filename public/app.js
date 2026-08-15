@@ -137,16 +137,18 @@ function setUiState(mode) {
   const paused = mode === 'paused';
   const stopped = mode === 'stopped';
 
+  document.body.className = `state-${mode || 'idle'}`;
+
   els.start.disabled = running || paused || isConnecting;
   els.pause.disabled = !(running || paused);
   els.stop.disabled = !(running || paused);
   if (els.mode) els.mode.disabled = running || paused || isConnecting;
-  els.pause.textContent = paused ? '继续' : '暂停';
+  els.pause.textContent = paused ? '▶ 继续' : '⏸ 暂停';
   const exportBlocked = shouldDisableExport({ entryCount: entries.length, finalizingCount });
   els.exportMd.disabled = exportBlocked;
   els.exportTxt.disabled = exportBlocked;
 
-  els.dot.className = 'record-dot';
+  els.dot.className = 'record-pulse-dot';
   if (running) {
     els.dot.classList.add('live');
     els.state.textContent = '正在录音';
@@ -697,7 +699,7 @@ async function connectGemini({ reconnect = false } = {}) {
             },
             systemInstruction: {
               parts: [{
-                text: 'You are a silent meeting translation listener. Do not speak, answer, summarize, or interrupt. Listen to Chinese, Vietnamese, and English technical project meetings and translate them into Chinese. Pay special attention to photovoltaic power, battery energy storage systems, EPC, grid connection, EMS, PCS, BMS, SCADA, 10kV, 35kV, 110kV, floating PV, fire protection, commissioning, acceptance, contracts, responsibilities, schedules, risks, and engineering decisions. Only the input audio transcription and output translation are used by the application.'
+                text: 'You are a silent meeting translation listener. Do not speak, answer, summarize, or interrupt. Listen to Chinese, Vietnamese, and English technical project meetings and translate them into Chinese. CRITICAL: Strictly distinguish English from Vietnamese. Do not mistake English greetings or words ("Hello", "Hi", "Testing", "OK", "Can you hear me") for Vietnamese ("Alo", "Chào"). Transcribe English speech strictly in English, Vietnamese in Vietnamese, and Chinese in Chinese. Pay special attention to photovoltaic power, battery energy storage systems, EPC, grid connection, EMS, PCS, BMS, SCADA, 10kV, 35kV, 110kV, floating PV, fire protection, commissioning, acceptance, contracts, responsibilities, schedules, risks, and engineering decisions. Only the input audio transcription and output translation are used by the application.'
               }]
             }
           }

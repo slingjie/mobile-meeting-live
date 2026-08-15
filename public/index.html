@@ -2,99 +2,116 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b0d10" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#080a0f" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>Meeting Live</title>
-  <link rel="stylesheet" href="/style.css?v=e9f0ff65" />
+  <title>Meeting Live · 实时会议转录</title>
+  <link rel="stylesheet" href="/style.css?v=1cdf946e" />
 </head>
-<body>
-  <main class="app-shell">
-    <header class="topbar">
-      <div>
-        <div class="eyebrow">MEETING LIVE</div>
-        <h1>实时会议转录</h1>
+<body class="state-idle">
+  <div class="app-container">
+    
+    <!-- 顶部 HUD 状态栏 -->
+    <header class="app-hud">
+      <div class="hud-left">
+        <div class="hud-brand">
+          <span class="record-pulse-dot" id="recordDot"></span>
+          <span class="hud-state-text" id="recordState">准备就绪</span>
+        </div>
+        <div class="hud-timer" id="timer">00:00:00</div>
       </div>
-      <div id="connectionBadge" class="badge idle">未连接</div>
+      <div class="hud-right">
+        <div id="connectionBadge" class="hud-badge idle">未连接</div>
+      </div>
     </header>
 
-    <section class="meeting-card">
-      <label class="field-label" for="meetingTitle">会议名称</label>
-      <input id="meetingTitle" class="title-input" type="text" placeholder="例如：鹏鼎 35MW 储能电站调试与并网沟通" autocomplete="off" />
-
-      <div class="mode-row">
-        <div>
-          <label class="field-label" for="audioCaptureMode">采音模式</label>
-          <select id="audioCaptureMode" class="mode-select">
-            <option value="table" selected>线下圆桌（AEC关/增益开 · 推荐）</option>
-            <option value="remote">远程/免提（AEC开 · 消喇叭回声）</option>
-          </select>
-        </div>
-        <div>
-          <label class="field-label" for="transcriptMode">转录模式</label>
-          <select id="transcriptMode" class="mode-select">
-            <option value="accurate" selected>实时草稿＋准确终稿（推荐）</option>
-            <option value="live">仅实时（不二次上传语音段）</option>
-          </select>
-        </div>
+    <!-- 配置面板 (仅在未开始时展示，开始识别后自动隐藏，字幕满屏) -->
+    <section class="setup-section" id="setupCard">
+      <div class="title-field-wrap">
+        <label class="field-label" for="meetingTitle">会议主题</label>
+        <input id="meetingTitle" class="title-input" type="text" placeholder="输入会议主题（如：广宁电厂现场会议）" autocomplete="off" />
       </div>
 
-      <details class="meeting-preset-details">
-        <summary class="preset-summary">⚙️ 会前热词与参会人预设（点击展开）</summary>
+      <details class="advanced-preset-details">
+        <summary class="preset-summary">
+          <span>⚙️ 高级配置与专有名词（可选）</span>
+          <span class="summary-arrow">›</span>
+        </summary>
         <div class="preset-body">
-          <label class="field-label" for="participants">参会人员（逗号分隔）</label>
-          <input id="participants" class="preset-input" type="text" placeholder="例如：戴总, 孙宇, 叶工, 阮工" autocomplete="off" />
-
-          <label class="field-label" for="hotwords">行业/项目热词（逗号分隔）</label>
-          <textarea id="hotwords" class="preset-textarea" placeholder="例如：鹏鼎, 道达尔, 35MW/87.5MWh, PCS, BMS, 并网柜, 削峰填谷" rows="2"></textarea>
+          <div class="config-grid">
+            <div class="config-item">
+              <label class="field-label" for="audioCaptureMode">采音模式</label>
+              <select id="audioCaptureMode" class="mode-select">
+                <option value="table" selected>线下圆桌（推荐）</option>
+                <option value="remote">远程/免提</option>
+              </select>
+            </div>
+            <div class="config-item">
+              <label class="field-label" for="transcriptMode">转录模式</label>
+              <select id="transcriptMode" class="mode-select">
+                <option value="accurate" selected>实时草稿＋准确终稿</option>
+                <option value="live">仅实时流</option>
+              </select>
+            </div>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="participants">参会人</label>
+            <input id="participants" class="preset-input" type="text" placeholder="例如：戴总, 孙宇, 叶工, 阮工" autocomplete="off" />
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="hotwords">行业热词</label>
+            <textarea id="hotwords" class="preset-textarea" placeholder="例如：PCS, BMS, 并网柜, 35MW/87.5MWh, 削峰填谷" rows="2"></textarea>
+          </div>
         </div>
       </details>
-
-      <div class="status-row">
-        <div class="recording-state">
-          <span id="recordDot" class="record-dot"></span>
-          <span id="recordState">准备就绪</span>
-        </div>
-        <div id="timer" class="timer">00:00:00</div>
-      </div>
-
-      <div id="trackSettingsBadge" class="track-settings-badge"></div>
-      <div id="ledgerWarning" class="ledger-warning hidden"></div>
-
-      <div class="mic-meter hidden" id="micMeter">
-        <span class="mic-meter-label">麦克风</span>
-        <div class="mic-meter-track"><div id="micLevel" class="mic-meter-fill"></div></div>
-      </div>
-      <div id="diagInfo" class="diag-info"></div>
     </section>
 
-    <section id="transcriptPanel" class="transcript-panel" aria-live="polite">
+    <!-- 硬件状态与告警 -->
+    <div id="trackSettingsBadge" class="track-settings-badge"></div>
+    <div id="ledgerWarning" class="ledger-warning hidden"></div>
+
+    <!-- 麦克风动效指示条 -->
+    <div class="mic-meter-bar hidden" id="micMeter">
+      <div id="micLevel" class="mic-meter-fill"></div>
+    </div>
+
+    <!-- 字幕展示面板 (录音时撑满整屏) -->
+    <section id="transcriptPanel" class="transcript-viewport" aria-live="polite">
       <div id="emptyState" class="empty-state">
-        <strong>点击“开始”即可实时转录</strong>
-        <span>支持中文 / 越南语 / 英文混合会议</span>
+        <div class="empty-icon">🎙️</div>
+        <strong>点击下方开始转录</strong>
+        <span>支持中文 / 越南语 / 英文混合会议与实时翻译</span>
       </div>
-      <div id="transcriptList" class="transcript-list"></div>
-      <div id="partialLine" class="partial-line hidden"></div>
+      <div id="transcriptList" class="transcript-stream"></div>
+      <div id="partialLine" class="partial-stream-line hidden"></div>
     </section>
 
-    <section class="controls">
-      <button id="startBtn" class="btn primary">开始</button>
-      <button id="pauseBtn" class="btn secondary" disabled>暂停</button>
-      <button id="stopBtn" class="btn danger" disabled>结束</button>
-    </section>
+    <!-- 底部控制栏 -->
+    <footer class="bottom-dock">
+      <div class="active-controls" id="activeControls">
+        <button id="startBtn" class="dock-btn btn-start">
+          <span class="btn-icon">▶</span> 开始转录
+        </button>
+        <button id="pauseBtn" class="dock-btn btn-pause" disabled>
+          <span class="btn-icon">⏸</span> 暂停
+        </button>
+        <button id="stopBtn" class="dock-btn btn-stop" disabled>
+          <span class="btn-icon">⏹</span> 结束
+        </button>
+      </div>
 
-    <section class="secondary-controls">
-      <button id="exportMdBtn" class="link-btn" disabled>导出 Markdown</button>
-      <button id="exportTxtBtn" class="link-btn" disabled>导出 TXT</button>
-      <button id="clearBtn" class="link-btn">清空记录</button>
-    </section>
+      <div class="idle-actions" id="idleActions">
+        <button id="exportMdBtn" class="action-btn" disabled>📥 导出 Markdown</button>
+        <button id="exportTxtBtn" class="action-btn" disabled>📄 导出 TXT</button>
+        <button id="clearBtn" class="action-btn text-danger">🗑️ 清空记录</button>
+      </div>
 
-    <footer id="privacyNote" class="footer-note">
-      实时音频发送至 Gemini Live API；准确模式会二次上传完整语音段，并附带最近5条已确认原文/译文作为上下文；结果文本保存在本机浏览器。
+      <div id="diagInfo" class="diag-meta"></div>
     </footer>
-  </main>
 
-  <script type="module" src="/app.js?v=e9f0ff65"></script>
+  </div>
+
+  <script type="module" src="/app.js?v=1cdf946e"></script>
 </body>
 </html>
